@@ -2,6 +2,7 @@ mod app;
 mod backend;
 mod cli;
 mod error;
+mod float;
 mod imagebuf;
 mod integration;
 mod ocr;

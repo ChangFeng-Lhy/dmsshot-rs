@@ -101,9 +101,19 @@ pub enum SelectorMode {
 }
 
 #[derive(Clone, Copy)]
-pub enum ThemeSource {
+pub(crate) enum ThemeSource {
     Gtk,
     Qt,
+}
+
+impl ThemeSource {
+    pub(crate) fn for_desktop(desktop: Option<&str>) -> Self {
+        if desktop.is_some_and(|value| value.to_ascii_lowercase().contains("kde")) {
+            Self::Qt
+        } else {
+            Self::Gtk
+        }
+    }
 }
 
 struct Surface {
@@ -499,6 +509,7 @@ impl SelectorState {
                         height,
                         self.show_cursor,
                         self.no_confirm,
+                        self.scroll_requested,
                         self.magnifier,
                         self.theme,
                     );
@@ -611,26 +622,13 @@ impl SelectorState {
     }
 
     fn confirm_selection(&mut self, qh: &QueueHandle<Self>) {
-        let Some((index, physical, global)) = self.selected_rect() else {
-            return;
-        };
         if !self.scroll_requested {
-            let source = if self.show_cursor {
-                &self.surfaces[index].with_cursor
-            } else {
-                &self.surfaces[index].without_cursor
-            };
-            match source.crop(physical.x, physical.y, physical.width, physical.height) {
-                Ok(mut image) => {
-                    image.region = global;
-                    image.scale = self.outputs[index].scale;
-                    self.result = Some(image);
-                }
-                Err(error) => self.error = Some(error),
-            }
-            self.running = false;
+            self.capture_static_selection();
             return;
         }
+        let Some((index, _, global)) = self.selected_rect() else {
+            return;
+        };
         if self.outputs[index].transform != 0 {
             self.error = Some(Error::RotatedScroll);
             self.running = false;
@@ -670,6 +668,26 @@ impl SelectorState {
         self.phase = Phase::Scroll;
         self.set_scroll_input_region(index, qh);
         self.redraw_all(qh);
+    }
+
+    fn capture_static_selection(&mut self) {
+        let Some((index, physical, global)) = self.selected_rect() else {
+            return;
+        };
+        let source = if self.show_cursor {
+            &self.surfaces[index].with_cursor
+        } else {
+            &self.surfaces[index].without_cursor
+        };
+        match source.crop(physical.x, physical.y, physical.width, physical.height) {
+            Ok(mut image) => {
+                image.region = global;
+                image.scale = self.outputs[index].scale;
+                self.result = Some(image);
+            }
+            Err(error) => self.error = Some(error),
+        }
+        self.running = false;
     }
 
     fn set_scroll_input_region(&self, selected: usize, qh: &QueueHandle<Self>) {
@@ -817,18 +835,13 @@ impl SelectorState {
 
     fn finish_scroll(&mut self) {
         let Some(scroll) = self.scroll.take() else {
+            self.capture_static_selection();
             return;
         };
-        let Some(stitcher) = scroll.stitcher else {
-            self.cancelled = true;
-            self.running = false;
+        let Some(stitcher) = scroll.stitcher.filter(|stitcher| stitcher.rows() > 0) else {
+            self.capture_static_selection();
             return;
         };
-        if stitcher.rows() == 0 {
-            self.cancelled = true;
-            self.running = false;
-            return;
-        }
         match stitcher.finish() {
             Ok(mut image) => {
                 image.scale = scroll.output.scale;
@@ -1512,7 +1525,7 @@ impl PointerHandler for SelectorState {
                 {
                     self.selection.dragging = false;
                     self.redraw_all(qh);
-                    if self.no_confirm {
+                    if self.no_confirm || self.scroll_requested {
                         self.confirm_selection(qh);
                     }
                 }
@@ -1595,11 +1608,22 @@ impl KeyboardHandler for SelectorState {
     fn release_key(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: KeyEvent,
+        event: KeyEvent,
     ) {
+        if !self.running || self.phase != Phase::Select || !self.selection.present {
+            return;
+        }
+        // Some compositors focus a newly mapped layer surface on the key press,
+        // so the matching release can be the first event delivered here.
+        if matches!(
+            event.keysym,
+            Keysym::Return | Keysym::KP_Enter | Keysym::space
+        ) {
+            self.confirm_selection(qh);
+        }
     }
     fn update_modifiers(
         &mut self,
@@ -1724,10 +1748,10 @@ fn selection_rect(selection: &Selection, width: u32, height: u32) -> (u32, u32, 
 }
 
 #[derive(Clone, Copy)]
-struct Theme {
-    background: [u8; 4],
-    text: [u8; 4],
-    accent: [u8; 4],
+pub(crate) struct Theme {
+    pub(crate) background: [u8; 4],
+    pub(crate) text: [u8; 4],
+    pub(crate) accent: [u8; 4],
 }
 impl Default for Theme {
     fn default() -> Self {
@@ -1739,7 +1763,7 @@ impl Default for Theme {
     }
 }
 impl Theme {
-    fn load(source: ThemeSource) -> Self {
+    pub(crate) fn load(source: ThemeSource) -> Self {
         match source {
             ThemeSource::Gtk => gtk_theme_colors(),
             ThemeSource::Qt => qt_theme_colors(),
@@ -2328,12 +2352,18 @@ fn draw_hud(
     height: u32,
     cursor: bool,
     no_confirm: bool,
+    scroll: bool,
     magnifier: bool,
     theme: Theme,
 ) {
-    let capture_key = if no_confirm { "release" } else { "enter" };
+    let capture_key = if no_confirm || scroll {
+        "release"
+    } else {
+        "enter"
+    };
     let cursor_desc = if cursor { "hide cursor" } else { "show cursor" };
-    let mut items = vec![(capture_key, "capture"), ("p", cursor_desc)];
+    let capture_desc = if scroll { "scroll" } else { "capture" };
+    let mut items = vec![(capture_key, capture_desc), ("p", cursor_desc)];
     if magnifier {
         items.push(("tab", "format"));
     }
@@ -2536,7 +2566,13 @@ fn draw_hint_item(
     description_x + text_width(description)
 }
 
-fn fill_rect(data: &mut [u8], width: u32, height: u32, rect: (u32, u32, u32, u32), color: [u8; 4]) {
+pub(crate) fn fill_rect(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    rect: (u32, u32, u32, u32),
+    color: [u8; 4],
+) {
     for y in rect.1..(rect.1 + rect.3).min(height) {
         for x in rect.0..(rect.0 + rect.2).min(width) {
             put_pixel(data, width, x, y, color);
@@ -2544,7 +2580,7 @@ fn fill_rect(data: &mut [u8], width: u32, height: u32, rect: (u32, u32, u32, u32
     }
 }
 
-fn fill_rounded_rect(
+pub(crate) fn fill_rounded_rect(
     data: &mut [u8],
     width: u32,
     height: u32,
@@ -2593,12 +2629,57 @@ fn fill_rounded_rect(
         );
     }
 }
-fn put_pixel(data: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
+pub(crate) fn put_pixel(data: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
     let i = (y as usize * width as usize + x as usize) * 4;
     data[i..i + 4].copy_from_slice(&color);
 }
-fn draw_text(data: &mut [u8], width: u32, height: u32, x: u32, y: u32, text: &str, color: [u8; 4]) {
+pub(crate) fn draw_text(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    text: &str,
+    color: [u8; 4],
+) {
     draw_text_weight(data, (width, height), (x, y), text, color, false);
+}
+
+pub(crate) fn draw_text_scaled(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    text: &str,
+    color: [u8; 4],
+    scale: f64,
+) {
+    if scale <= 0.0 || !scale.is_finite() {
+        return;
+    }
+    let advance = 6.0 * scale;
+    for (index, ch) in text.chars().enumerate() {
+        let glyph = glyph(ch);
+        for (row, bits) in glyph.into_iter().enumerate() {
+            let top = y + (row as f64 * scale).round() as u32;
+            let bottom = y + ((row + 1) as f64 * scale).round() as u32;
+            for col in 0..5 {
+                if bits & (1 << (4 - col)) == 0 {
+                    continue;
+                }
+                let left = x + (index as f64 * advance + col as f64 * scale).round() as u32;
+                let right = x + (index as f64 * advance + (col + 1) as f64 * scale).round() as u32;
+                for py in top..bottom {
+                    for px in left..right.max(left + 1) {
+                        if px < width && py < height {
+                            put_pixel(data, width, px, py, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 fn draw_text_bold(
     data: &mut [u8],
@@ -2640,8 +2721,15 @@ fn draw_text_weight(
         }
     }
 }
-fn text_width(text: &str) -> u32 {
+pub(crate) fn text_width(text: &str) -> u32 {
     text.chars().count() as u32 * 6
+}
+
+pub(crate) fn text_width_scaled(text: &str, scale: f64) -> u32 {
+    if scale <= 0.0 || !scale.is_finite() {
+        return 0;
+    }
+    (text.chars().count() as f64 * 6.0 * scale).round() as u32
 }
 fn bold_text_width(text: &str) -> u32 {
     text.chars().count() as u32 * 7

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::backend::BackendPreference;
+use crate::{backend::BackendPreference, overlay::ThemeSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CursorMode {
@@ -168,11 +168,20 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_notify: bool,
 
-    /// Use colors from the active GTK theme for interactive overlays (default).
+    /// Keep the captured image in an always-on-top floating window until it is closed.
+    #[arg(
+        long = "float",
+        visible_alias = "pin",
+        conflicts_with = "stdout",
+        global = true
+    )]
+    pub float: bool,
+
+    /// Use colors from the active GTK theme for overlays and the floating preview (default outside KDE).
     #[arg(long, conflicts_with = "qt", global = true)]
     pub gtk: bool,
 
-    /// Use colors from qt6ct, qt5ct, or KDE for interactive overlays.
+    /// Use colors from qt6ct, qt5ct, or KDE (default in a KDE session).
     #[arg(long, conflicts_with = "gtk", global = true)]
     pub qt: bool,
 
@@ -192,6 +201,17 @@ impl Cli {
 
     pub fn validate(&self) -> std::result::Result<(), String> {
         let command = self.command();
+        if self.float
+            && matches!(
+                command,
+                Command::Ocr { .. } | Command::Magnifier | Command::List
+            )
+        {
+            return Err(
+                "--float is only supported for region, scroll, full, all, output, and window"
+                    .into(),
+            );
+        }
         let interactive = matches!(
             command,
             Command::Region | Command::Scroll { .. } | Command::Ocr { .. }
@@ -223,6 +243,16 @@ impl Cli {
         positional
             .map(ToOwned::to_owned)
             .or_else(|| self.output.clone())
+    }
+
+    pub fn theme_source(&self) -> ThemeSource {
+        if self.qt {
+            ThemeSource::Qt
+        } else if self.gtk {
+            ThemeSource::Gtk
+        } else {
+            ThemeSource::for_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref())
+        }
     }
 }
 
@@ -297,6 +327,49 @@ mod tests {
         assert!(qt.qt);
         assert!(!qt.gtk);
         assert!(Cli::try_parse_from(["dmsshot", "--gtk", "--qt"]).is_err());
+    }
+
+    #[test]
+    fn float_is_opt_in_and_has_pin_alias() {
+        let cli = Cli::try_parse_from(["dmsshot", "region"]).unwrap();
+        assert!(!cli.float);
+        let cli = Cli::try_parse_from(["dmsshot", "--float", "region"]).unwrap();
+        assert!(cli.float);
+        let cli = Cli::try_parse_from(["dmsshot", "--pin", "full"]).unwrap();
+        assert!(cli.float);
+        assert!(Cli::try_parse_from(["dmsshot", "--float", "--stdout"]).is_err());
+    }
+
+    #[test]
+    fn float_rejects_commands_without_an_image_to_show() {
+        for command in ["ocr", "magnifier", "list"] {
+            let cli = Cli::try_parse_from(["dmsshot", command, "--float"]).unwrap();
+            assert!(cli.validate().is_err(), "{command} accepted --float");
+        }
+        for command in ["region", "scroll", "full", "all", "window", "output"] {
+            let args: Vec<&str> = if command == "output" {
+                vec!["dmsshot", command, "DP-1", "--float"]
+            } else {
+                vec!["dmsshot", command, "--float"]
+            };
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.validate().is_ok(), "{command} rejected --float");
+        }
+    }
+
+    #[test]
+    fn kde_sessions_default_to_qt_theme_source() {
+        use crate::overlay::ThemeSource;
+
+        assert!(matches!(
+            ThemeSource::for_desktop(Some("KDE")),
+            ThemeSource::Qt
+        ));
+        assert!(matches!(
+            ThemeSource::for_desktop(Some("niri")),
+            ThemeSource::Gtk
+        ));
+        assert!(matches!(ThemeSource::for_desktop(None), ThemeSource::Gtk));
     }
 
     #[test]

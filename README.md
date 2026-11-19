@@ -70,6 +70,8 @@ dmsshot-rs region --magnifier --zoom 2
 dmsshot-rs list            # output information
 dmsshot-rs --be niri full  # force the niri backend
 dmsshot-rs --be kde window # force the KDE/KWin backend
+dmsshot-rs --float region  # keep the result in an always-on-top window
+dmsshot-rs --pin full      # alias for --float
 ```
 
 Run `dmsshot-rs --help` for image format, destination, cursor, JSON, and stdout options. Region mode
@@ -82,7 +84,8 @@ magnification (default `2`). While the magnifier is visible, press `Tab` to cycl
 through `HEX`, `RGB`, and `HSL`; the default is `HEX`. Color text is always opaque; full-output
 captures are already composited by the compositor, so visually transparent windows still produce
 opaque colors.
-Scroll mode finishes with Enter or the Done button. Successful file
+Scroll mode starts as soon as the selection is released and finishes with Enter or the Done button;
+if nothing was scrolled, the selected region is pinned as a normal capture. Successful file
 captures are copied and notified by default; use `--no-clipboard` or `--no-notify` to disable either
 integration. When niri is selected, the `window` command relies on niri's native
 `ScreenshotWindow` action, which always sets the clipboard as an inherent compositor side effect,
@@ -100,6 +103,29 @@ current directory.
 The default format is PNG and the generated filename is
 `screenshot_YYYY-MM-DD_HH-MM-SS.png`, using local time. Selecting JPEG or PPM changes the filename
 extension accordingly, while `--filename` overrides the generated name.
+
+## Floating preview
+
+Pass `--float` (alias `--pin`) to keep the captured image in an always-on-top window after the
+save, clipboard, path, and JSON steps complete. It works with `region`, `scroll`, `full`, `all`,
+`output`, and `window`; `ocr`, `magnifier`, and `list` reject it, and it conflicts with `--stdout`.
+The process stays in the foreground until the window closes and then exits successfully. Desktop
+notifications are suppressed while the floating window is visible because the window itself is the
+feedback; clipboard copying is unchanged.
+
+The window opens at the original selection for `region` and `scroll`, centered on the captured
+output for `full` and `output`, and centered on the focused output for `all` and `window` when the
+backend can report it (otherwise the first output). At 100% the preview is rendered at the target
+output's physical pixel density, so a capture and display scale of 1.5 maps pixels 1:1 instead of
+being upscaled from a logical-size buffer; the initial size is capped at 90% of the output.
+Left-drag moves the image freely across outputs, the wheel zooms between 10% and 400% around the
+window center, `O` opens the saved file, `F` opens its folder, and Escape, double-click, or
+middle-click closes the window. A percentage badge appears whenever the zoom is not 100%.
+
+The window uses a layer-shell Overlay surface with 12px rounded corners, a theme-colored border,
+and a 20px shadow. Only the image rectangle accepts pointer input, so clicks on the shadow fall
+through to the application below. KWin 6.8 exposes `zwlr_layer_shell_v1`; on compositors without
+layer-shell the command fails instead of silently showing a window that may not stay on top.
 
 ## Wayland and compositor backends
 
@@ -181,9 +207,10 @@ license.
 
 ## GTK and Qt theme support
 
-The region and scrolling overlays use GTK colors by default. Pass `--gtk` to select GTK explicitly
-or `--qt` to use Qt colors; the two options are mutually exclusive and may be placed before or after
-the command.
+The selector overlays and the floating preview use GTK colors by default and switch to Qt colors
+automatically in a KDE session (`XDG_CURRENT_DESKTOP` contains `KDE`). Pass `--gtk` to select GTK
+explicitly or `--qt` to use Qt colors; the two options are mutually exclusive and may be placed
+before or after the command.
 
 GTK theme discovery uses `GTK_THEME` first and then
 `org.gnome.desktop.interface gtk-theme` from `gsettings`. Both GTK 3 and GTK 4 CSS files are

@@ -218,7 +218,7 @@ impl WaylandCapture {
     }
 }
 
-fn output_info(info: smithay_client_toolkit::output::OutputInfo) -> OutputInfo {
+pub(crate) fn output_info(info: smithay_client_toolkit::output::OutputInfo) -> OutputInfo {
     let transform = u32::from(info.transform) as i32;
     let mode = info
         .modes

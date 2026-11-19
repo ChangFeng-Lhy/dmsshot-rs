@@ -11,9 +11,10 @@ use crate::{
     backend::{CaptureSource, DesktopBackend, OutputInfo, WindowCapture},
     cli::{Cli, Command, OcrEngine},
     error::{Error, Result},
+    float,
     imagebuf::ImageBuffer,
     integration, ocr,
-    overlay::{self, Background, SelectorMode, SelectorOptions, ThemeSource},
+    overlay::{self, Background, SelectorMode, SelectorOptions},
     state,
     wayland::WaylandCapture,
 };
@@ -58,6 +59,7 @@ impl Application {
 
     pub fn run(self) -> Result<()> {
         let command = self.cli.command();
+        let place_at_region = matches!(&command, Command::Region | Command::Scroll { .. });
         if command == Command::List {
             return self.list_outputs();
         }
@@ -113,7 +115,26 @@ impl Application {
             }
             return Ok(());
         };
-        self.write_result(&image, clipboard_already_set)
+        let path = self.write_result(&image, clipboard_already_set)?;
+        if self.cli.float
+            && let Some(path) = path
+        {
+            let output = if image.region.output.is_empty() {
+                self.backend.focused_output_name()
+            } else {
+                Some(image.region.output.clone())
+            };
+            float::show(
+                image,
+                path,
+                float::FloatOptions {
+                    output,
+                    place_at_region,
+                    theme_source: self.cli.theme_source(),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn run_ocr(
@@ -192,11 +213,7 @@ impl Application {
                 show_cursor: self.cli.cursor.enabled(),
                 magnifier: true,
                 zoom: self.cli.zoom(),
-                theme_source: if self.cli.qt {
-                    ThemeSource::Qt
-                } else {
-                    ThemeSource::Gtk
-                },
+                theme_source: self.cli.theme_source(),
             },
             &mut capture,
         )?;
@@ -307,11 +324,7 @@ impl Application {
                 show_cursor: self.cli.cursor.enabled(),
                 magnifier: self.cli.magnifier,
                 zoom: self.cli.zoom(),
-                theme_source: if self.cli.qt {
-                    ThemeSource::Qt
-                } else {
-                    ThemeSource::Gtk
-                },
+                theme_source: self.cli.theme_source(),
             },
             &mut capture,
         )?;
@@ -321,13 +334,17 @@ impl Application {
         Ok(image)
     }
 
-    fn write_result(&self, image: &ImageBuffer, clipboard_already_set: bool) -> Result<()> {
+    fn write_result(
+        &self,
+        image: &ImageBuffer,
+        clipboard_already_set: bool,
+    ) -> Result<Option<PathBuf>> {
         if self.cli.stdout {
             let stdout = io::stdout();
             let mut lock = stdout.lock();
             image.write_encoded(&mut lock, self.cli.format, self.cli.quality)?;
             lock.flush()?;
-            return Ok(());
+            return Ok(None);
         }
 
         let mut encoded = Vec::new();
@@ -364,10 +381,10 @@ impl Application {
         } else {
             println!("{path_text}");
         }
-        if !self.cli.no_notify {
+        if !self.cli.no_notify && !self.cli.float {
             integration::notify_success(&path, copied);
         }
-        Ok(())
+        Ok(Some(path))
     }
 }
 
